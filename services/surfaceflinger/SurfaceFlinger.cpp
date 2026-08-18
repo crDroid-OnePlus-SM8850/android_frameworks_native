@@ -230,6 +230,52 @@ namespace {
 
 static constexpr int FOUR_K_WIDTH = 3840;
 static constexpr int FOUR_K_HEIGHT = 2160;
+constexpr char kOplusLtpoDisplayOnProperty[] = "sys.oplus.ltpo.display_on";
+
+#ifdef QCOM_UM_FAMILY
+constexpr char kOplusAdfrProperty[] = "persist.oplus.display.vrr.adfr";
+constexpr char kOplusLtpoModeSwitchPendingProperty[] =
+        "sys.oplus.ltpo.mode_switch_pending";
+constexpr char kOplusLtpoQsyncActiveProperty[] = "sys.oplus.ltpo.qsync_active";
+
+Fps getOplusAdfrRenderFps(Fps requestedFps) {
+    return requestedFps.getValue() > 120.f ? Fps::fromValue(120.f) : requestedFps;
+}
+
+DisplayModePtr findOplusAdfrMode(const DisplayModes& modes,
+                                 const ftl::NonNull<DisplayModePtr>& requestedMode) {
+    if (base::GetIntProperty(kOplusAdfrProperty, 0) != 2) {
+        return nullptr;
+    }
+
+    DisplayModePtr adfrMode;
+    size_t matchingModes = 0;
+    for (const auto& [_, mode] : modes) {
+        if (mode->getResolution() != requestedMode->getResolution() ||
+            std::abs(mode->getVsyncRate().getValue() - 120.f) > 0.5f) {
+            continue;
+        }
+
+        matchingModes++;
+        if (!adfrMode || mode->getHwcId() > adfrMode->getHwcId()) {
+            adfrMode = mode;
+        }
+    }
+    return matchingModes > 1 ? adfrMode : nullptr;
+}
+
+bool isOplusAdfrMode(const scheduler::RefreshRateSelector& selector,
+                     const scheduler::FrameRateMode& mode) {
+    const auto adfrMode = findOplusAdfrMode(selector.displayModes(), mode.modePtr);
+    return adfrMode && adfrMode->getId() == mode.modePtr->getId();
+}
+
+bool isOplusAdfrModeAllowed(const scheduler::RefreshRateSelector& selector,
+                            const scheduler::FrameRateMode& mode) {
+    return isOplusAdfrMode(selector, mode) &&
+            selector.getCurrentPolicy().appRequestRanges.render.includes(mode.fps);
+}
+#endif
 
 // TODO(b/141333600): Consolidate with DisplayMode::Builder::getDefaultDensity.
 constexpr float FALLBACK_DENSITY = ACONFIGURATION_DENSITY_TV;
@@ -1715,7 +1761,11 @@ void SurfaceFlinger::initiateDisplayModeChanges() {
 
         // The desired mode is different from the active mode. However, the allowed modes might have
         // changed since setDesiredMode scheduled a mode transition.
-        if (!selectorPtr->isModeAllowed(desiredMode.mode)) {
+        bool isModeAllowed = selectorPtr->isModeAllowed(desiredMode.mode);
+#ifdef QCOM_UM_FAMILY
+        isModeAllowed = isModeAllowed || isOplusAdfrModeAllowed(*selectorPtr, desiredMode.mode);
+#endif
+        if (!isModeAllowed) {
             if (FlagManager::getInstance().modeset_state_machine()) {
                 dropModeRequest(std::move(desiredMode));
             } else {
@@ -1723,6 +1773,22 @@ void SurfaceFlinger::initiateDisplayModeChanges() {
             }
             continue;
         }
+
+#ifdef QCOM_UM_FAMILY
+        const bool changesHwcConfig =
+                activeMode.modePtr->getHwcId() != desiredMode.mode.modePtr->getHwcId();
+        if (changesHwcConfig &&
+            base::GetBoolProperty(kOplusLtpoQsyncActiveProperty, false)) {
+            if (!base::SetProperty(kOplusLtpoModeSwitchPendingProperty, "true")) {
+                ALOGE("%s: Failed to request LTPO release before mode switch", __func__);
+            }
+            if (FlagManager::getInstance().modeset_state_machine()) {
+                mDisplayModeController.setDesiredMode(displayId, std::move(desiredMode));
+            }
+            scheduleComposite(FrameHint::kNone);
+            continue;
+        }
+#endif
 
         ALOGV("Mode setting display %s to %d (%s)", to_string(displayId).c_str(),
               ftl::to_underlying(desiredModeId),
@@ -4813,6 +4879,19 @@ void SurfaceFlinger::requestDisplayModes(std::vector<display::DisplayModeRequest
     ConditionalLock lock(mStateLock, std::this_thread::get_id() != mMainThreadId);
 
     for (auto& request : modeRequests) {
+#ifdef QCOM_UM_FAMILY
+        const auto requestedDisplayId = request.mode.modePtr->getPhysicalDisplayId();
+        if (const auto display = getDisplayDeviceLocked(requestedDisplayId)) {
+            if (const auto adfrMode = findOplusAdfrMode(
+                        display->refreshRateSelector().displayModes(), request.mode.modePtr)) {
+                scheduler::FrameRateMode mode{.fps = getOplusAdfrRenderFps(request.mode.fps),
+                                              .modePtr = ftl::as_non_null(adfrMode)};
+                if (isOplusAdfrModeAllowed(display->refreshRateSelector(), mode)) {
+                    request.mode = std::move(mode);
+                }
+            }
+        }
+#endif
         const auto& modePtr = request.mode.modePtr;
 
         const auto displayId = modePtr->getPhysicalDisplayId();
@@ -4820,7 +4899,12 @@ void SurfaceFlinger::requestDisplayModes(std::vector<display::DisplayModeRequest
 
         if (!display) continue;
 
-        if (display->refreshRateSelector().isModeAllowed(request.mode)) {
+        bool isModeAllowed = display->refreshRateSelector().isModeAllowed(request.mode);
+#ifdef QCOM_UM_FAMILY
+        isModeAllowed = isModeAllowed ||
+                isOplusAdfrModeAllowed(display->refreshRateSelector(), request.mode);
+#endif
+        if (isModeAllowed) {
             setDesiredMode(request);
         } else {
             ALOGV("%s: Mode %d is disallowed for display %s", __func__,
@@ -6137,14 +6221,28 @@ void SurfaceFlinger::setPhysicalDisplayPowerMode(const sp<DisplayDevice>& displa
     const auto displayId = display->getPhysicalId();
     ALOGD("Setting power mode %d on physical display %s", mode, to_string(displayId).c_str());
 
-    const auto currentMode = display->getPowerMode();
-    if (currentMode == mode) {
-        return;
-    }
-
     const bool isInternalDisplay = mPhysicalDisplays.get(displayId)
                                            .transform(&PhysicalDisplay::isInternal)
                                            .value_or(false);
+#ifdef QCOM_UM_FAMILY
+    const bool publishInfinitiPowerState =
+            isInternalDisplay && base::GetIntProperty(kOplusAdfrProperty, 0) == 2;
+#else
+    constexpr bool publishInfinitiPowerState = false;
+#endif
+
+    const auto currentMode = display->getPowerMode();
+    if (currentMode == mode) {
+        if (publishInfinitiPowerState) {
+            base::SetProperty(kOplusLtpoDisplayOnProperty,
+                              mode == hal::PowerMode::ON ? "true" : "false");
+        }
+        return;
+    }
+
+    if (publishInfinitiPowerState && mode != hal::PowerMode::ON) {
+        base::SetProperty(kOplusLtpoDisplayOnProperty, "false");
+    }
 
     const bool couldRefresh = display->isRefreshable();
     display->setPowerMode(mode);
@@ -6273,6 +6371,10 @@ void SurfaceFlinger::setPhysicalDisplayPowerMode(const sp<DisplayDevice>& displa
     if (displayId == mFrontInternalDisplayId) {
         mTimeStats->setPowerMode(mode);
         mScheduler->setActiveDisplayPowerModeForRefreshRateStats(mode);
+    }
+
+    if (publishInfinitiPowerState && mode == hal::PowerMode::ON) {
+        base::SetProperty(kOplusLtpoDisplayOnProperty, "true");
     }
 
     ALOGD("Finished setting power mode %d on physical display %s", mode,
@@ -8726,13 +8828,26 @@ status_t SurfaceFlinger::applyRefreshRateSelectorPolicy(
     }
 
     auto preferredMode = std::move(*preferredModeOpt);
+#ifdef QCOM_UM_FAMILY
+    if (const auto adfrMode = findOplusAdfrMode(selector.displayModes(), preferredMode.modePtr)) {
+        scheduler::FrameRateMode mode{.fps = getOplusAdfrRenderFps(preferredMode.fps),
+                                      .modePtr = ftl::as_non_null(adfrMode)};
+        if (isOplusAdfrModeAllowed(selector, mode)) {
+            preferredMode = std::move(mode);
+        }
+    }
+#endif
     const auto preferredModeId = preferredMode.modePtr->getId();
 
     const Fps preferredFps = preferredMode.fps;
     ALOGV("Switching to Scheduler preferred mode %d (%s)", ftl::to_underlying(preferredModeId),
           to_string(preferredFps).c_str());
 
-    if (!selector.isModeAllowed(preferredMode)) {
+    bool isModeAllowed = selector.isModeAllowed(preferredMode);
+#ifdef QCOM_UM_FAMILY
+    isModeAllowed = isModeAllowed || isOplusAdfrModeAllowed(selector, preferredMode);
+#endif
+    if (!isModeAllowed) {
         ALOGE("%s: Preferred mode %d is disallowed", __func__, ftl::to_underlying(preferredModeId));
         return INVALID_OPERATION;
     }
